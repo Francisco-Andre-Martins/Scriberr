@@ -106,7 +106,7 @@ export function Register({ onRegister }: RegisterProps) {
                     <ScriberrLogo onClick={() => navigate({ path: 'home' })} />
                 </div>
 					<h2 className="text-3xl font-bold text-gray-900 dark:text-gray-100">
-						Welcome to Scriberr
+						Welcome to FALM
 					</h2>
 					<p className="mt-2 text-gray-600 dark:text-gray-400">
 						Create your admin account to get started
@@ -117,7 +117,7 @@ export function Register({ onRegister }: RegisterProps) {
 					<CardHeader>
 						<CardTitle className="text-gray-900 dark:text-gray-100">Setup Admin Account</CardTitle>
 						<CardDescription className="text-gray-600 dark:text-gray-400">
-							This will be the only account that can access this Scriberr instance
+							This will be the only account that can access this FALM Transcribe instance
 						</CardDescription>
 					</CardHeader>
 					<CardContent>
@@ -233,7 +233,7 @@ export function Register({ onRegister }: RegisterProps) {
 
 				<div className="text-center">
 					<p className="text-sm text-gray-600 dark:text-gray-400">
-						This account will have full administrative access to your Scriberr instance
+						This account will have full administrative access to your FALM Transcribe instance
 					</p>
 				</div>
 			</div>
