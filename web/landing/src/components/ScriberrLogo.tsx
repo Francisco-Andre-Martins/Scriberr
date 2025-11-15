@@ -1,8 +1,8 @@
 export function ScriberrLogo({ className = '' }: { className?: string }) {
   return (
     <img
-      src="/brand-falm.png"
-      alt="Falm Transcription"
+      src="/scriberr-logo.png"
+      alt="Scriberr"
       className={`w-auto select-none ${className}`}
     />
   );
