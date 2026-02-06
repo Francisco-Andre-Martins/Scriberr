@@ -16,7 +16,11 @@ import (
 	"scriberr/internal/auth"
 	"scriberr/internal/config"
 	"scriberr/internal/database"
+	"scriberr/internal/processing"
 	"scriberr/internal/queue"
+	"scriberr/internal/repository"
+	"scriberr/internal/service"
+	"scriberr/internal/sse"
 	"scriberr/internal/transcription"
 
 	"github.com/gin-gonic/gin"
@@ -30,7 +34,7 @@ type SecurityTestSuite struct {
 	config                    *config.Config
 	authService               *auth.AuthService
 	taskQueue                 *queue.TaskQueue
-	whisperXService           *transcription.WhisperXService
+	unifiedProcessor          *transcription.UnifiedJobProcessor
 	quickTranscriptionService *transcription.QuickTranscriptionService
 	handler                   *api.Handler
 }
@@ -46,8 +50,8 @@ func (suite *SecurityTestSuite) SetupSuite() {
 		DatabasePath: "security_test.db",
 		JWTSecret:    "test-secret",
 		UploadDir:    "security_test_uploads",
-		UVPath:       "uv",
-		WhisperXEnv:  "test_whisperx_env",
+
+		WhisperXEnv: "test_whisperx_env",
 	}
 
 	// Initialize test database
@@ -57,14 +61,56 @@ func (suite *SecurityTestSuite) SetupSuite() {
 
 	// Initialize services
 	suite.authService = auth.NewAuthService(suite.config.JWTSecret)
-	suite.whisperXService = transcription.NewWhisperXService(suite.config)
+	// Initialize repositories
+	jobRepo := repository.NewJobRepository(database.DB)
+	userRepo := repository.NewUserRepository(database.DB)
+	apiKeyRepo := repository.NewAPIKeyRepository(database.DB)
+	profileRepo := repository.NewProfileRepository(database.DB)
+	llmConfigRepo := repository.NewLLMConfigRepository(database.DB)
+	summaryRepo := repository.NewSummaryRepository(database.DB)
+	chatRepo := repository.NewChatRepository(database.DB)
+	noteRepo := repository.NewNoteRepository(database.DB)
+	speakerMappingRepo := repository.NewSpeakerMappingRepository(database.DB)
+	refreshTokenRepo := repository.NewRefreshTokenRepository(database.DB)
+
+	// Initialize services
+	userService := service.NewUserService(userRepo, suite.authService)
+	fileService := service.NewFileService()
+
+	// Initialize services
+	suite.unifiedProcessor = transcription.NewUnifiedJobProcessor(jobRepo, suite.config.TempDir, suite.config.TranscriptsDir)
 	var err error
-	suite.quickTranscriptionService, err = transcription.NewQuickTranscriptionService(suite.config, suite.whisperXService)
+	suite.quickTranscriptionService, err = transcription.NewQuickTranscriptionService(suite.config, suite.unifiedProcessor, jobRepo)
 	if err != nil {
 		suite.T().Fatal("Failed to initialize quick transcription service:", err)
 	}
-	suite.taskQueue = queue.NewTaskQueue(1, suite.whisperXService)
-	suite.handler = api.NewHandler(suite.config, suite.authService, suite.taskQueue, suite.whisperXService, suite.quickTranscriptionService)
+	suite.taskQueue = queue.NewTaskQueue(1, suite.unifiedProcessor, jobRepo)
+
+	broadcaster := sse.NewBroadcaster()
+
+	multiTrackProcessor := processing.NewMultiTrackProcessor(database.DB, jobRepo)
+
+	suite.handler = api.NewHandler(
+		suite.config,
+		suite.authService,
+		userService,
+		fileService,
+		jobRepo,
+		apiKeyRepo,
+		profileRepo,
+		userRepo,
+		llmConfigRepo,
+		summaryRepo,
+		chatRepo,
+		noteRepo,
+		speakerMappingRepo,
+		refreshTokenRepo,
+		suite.taskQueue,
+		suite.unifiedProcessor,
+		suite.quickTranscriptionService,
+		multiTrackProcessor,
+		broadcaster,
+	)
 
 	// Set up router
 	suite.router = api.SetupRoutes(suite.handler, suite.authService)

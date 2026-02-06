@@ -2,6 +2,7 @@ package adapters
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,9 +12,12 @@ import (
 	"time"
 
 	"scriberr/internal/transcription/interfaces"
-	"scriberr/internal/transcription/registry"
+	"scriberr/pkg/downloader"
 	"scriberr/pkg/logger"
 )
+
+//go:embed py/nvidia/*
+var nvidiaScripts embed.FS
 
 // CanaryAdapter implements the TranscriptionAdapter interface for NVIDIA Canary
 type CanaryAdapter struct {
@@ -22,9 +26,7 @@ type CanaryAdapter struct {
 }
 
 // NewCanaryAdapter creates a new Canary adapter
-func NewCanaryAdapter() *CanaryAdapter {
-	envPath := "whisperx-env/parakeet" // Shares environment with Parakeet
-	
+func NewCanaryAdapter(envPath string) *CanaryAdapter {
 	capabilities := interfaces.ModelCapabilities{
 		ModelID:     "canary",
 		ModelFamily: "nvidia_canary",
@@ -35,9 +37,9 @@ func NewCanaryAdapter() *CanaryAdapter {
 			"en", "de", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt", "ru", "zh",
 			// Canary supports many more languages
 		},
-		SupportedFormats:   []string{"wav", "flac"},
-		RequiresGPU:        false, // Can run on CPU but GPU strongly recommended
-		MemoryRequirement:  8192,  // 8GB+ recommended for Canary
+		SupportedFormats:  []string{"wav", "flac"},
+		RequiresGPU:       false, // Can run on CPU but GPU strongly recommended
+		MemoryRequirement: 8192,  // 8GB+ recommended for Canary
 		Features: map[string]bool{
 			"timestamps":     true,
 			"word_level":     true,
@@ -70,7 +72,7 @@ func NewCanaryAdapter() *CanaryAdapter {
 		},
 		{
 			Name:        "target_lang",
-			Type:        "string", 
+			Type:        "string",
 			Required:    false,
 			Default:     "en",
 			Options:     []string{"en", "de", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt", "ru", "zh"},
@@ -148,7 +150,7 @@ func NewCanaryAdapter() *CanaryAdapter {
 	}
 
 	baseAdapter := NewBaseAdapter("canary", envPath, capabilities, schema)
-	
+
 	adapter := &CanaryAdapter{
 		BaseAdapter: baseAdapter,
 		envPath:     envPath,
@@ -165,6 +167,11 @@ func (c *CanaryAdapter) GetSupportedModels() []string {
 // PrepareEnvironment sets up the Canary environment (shared with Parakeet)
 func (c *CanaryAdapter) PrepareEnvironment(ctx context.Context) error {
 	logger.Info("Preparing NVIDIA Canary environment", "env_path", c.envPath)
+
+	// Copy transcription script
+	if err := c.copyTranscriptionScript(); err != nil {
+		return fmt.Errorf("failed to copy transcription script: %w", err)
+	}
 
 	// Check if environment is already ready (using cache to speed up repeated checks)
 	if CheckEnvironmentReady(c.envPath, "import nemo.collections.asr") {
@@ -186,11 +193,6 @@ func (c *CanaryAdapter) PrepareEnvironment(ctx context.Context) error {
 		return fmt.Errorf("failed to download Canary model: %w", err)
 	}
 
-	// Create transcription script
-	if err := c.createTranscriptionScript(); err != nil {
-		return fmt.Errorf("failed to create transcription script: %w", err)
-	}
-
 	c.initialized = true
 	logger.Info("Canary environment prepared successfully")
 	return nil
@@ -209,26 +211,23 @@ func (c *CanaryAdapter) setupCanaryEnvironment() error {
 		return nil
 	}
 
-	// Create pyproject.toml (same as Parakeet since they share environment)
-	pyprojectContent := `[project]
-name = "parakeet-transcription"
-version = "0.1.0"
-description = "Audio transcription using NVIDIA Parakeet models"
-requires-python = ">=3.11"
-dependencies = [
-    "nemo-toolkit[asr]",
-    "torch",
-    "torchaudio",
-    "librosa",
-    "soundfile",
-    "ml-dtypes>=0.3.1,<0.5.0",
-    "onnx>=1.15.0,<1.18.0",
-]
+	// Read pyproject.toml
+	pyprojectContent, err := nvidiaScripts.ReadFile("py/nvidia/pyproject.toml")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded pyproject.toml: %w", err)
+	}
 
-[tool.uv.sources]
-nemo-toolkit = { git = "https://github.com/NVIDIA/NeMo.git" }
-`
-	if err := os.WriteFile(pyprojectPath, []byte(pyprojectContent), 0644); err != nil {
+	// Replace the hardcoded PyTorch URL with the dynamic one based on environment
+	// The static file contains the default cu126 URL
+	contentStr := strings.Replace(
+		string(pyprojectContent),
+		"https://download.pytorch.org/whl/cu126",
+		GetPyTorchWheelURL(),
+		1,
+	)
+
+	pyprojectPath = filepath.Join(c.envPath, "pyproject.toml")
+	if err := os.WriteFile(pyprojectPath, []byte(contentStr), 0644); err != nil {
 		return fmt.Errorf("failed to write pyproject.toml: %w", err)
 	}
 
@@ -256,28 +255,14 @@ func (c *CanaryAdapter) downloadCanaryModel() error {
 	}
 
 	logger.Info("Downloading Canary model", "path", modelPath)
-	
+
 	modelURL := "https://huggingface.co/nvidia/canary-1b-v2/resolve/main/canary-1b-v2.nemo?download=true"
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	tempPath := modelPath + ".tmp"
-	os.Remove(tempPath)
-
-	cmd := exec.CommandContext(ctx, "curl",
-		"-L", "--progress-bar", "--create-dirs",
-		"-o", tempPath, modelURL)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to download Canary model: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	if err := os.Rename(tempPath, modelPath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to move downloaded model: %w", err)
+	if err := downloader.DownloadFile(ctx, modelURL, modelPath); err != nil {
+		return fmt.Errorf("failed to download Canary model: %w", err)
 	}
 
 	stat, err := os.Stat(modelPath)
@@ -292,213 +277,20 @@ func (c *CanaryAdapter) downloadCanaryModel() error {
 	return nil
 }
 
-// createTranscriptionScript creates the Python script for Canary transcription
-func (c *CanaryAdapter) createTranscriptionScript() error {
-	scriptPath := filepath.Join(c.envPath, "canary_transcribe.py")
-	
-	// Check if script already exists
-	if _, err := os.Stat(scriptPath); err == nil {
-		return nil
+// copyTranscriptionScript creates the Python script for Canary transcription
+func (c *CanaryAdapter) copyTranscriptionScript() error {
+	// Ensure directory exists before writing script
+	if err := os.MkdirAll(c.envPath, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	scriptContent := `#!/usr/bin/env python3
-"""
-NVIDIA Canary multilingual transcription and translation script.
-"""
+	scriptContent, err := nvidiaScripts.ReadFile("py/nvidia/canary_transcribe.py")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded canary_transcribe.py: %w", err)
+	}
 
-import argparse
-import json
-import sys
-import os
-from pathlib import Path
-import nemo.collections.asr as nemo_asr
-
-
-def transcribe_audio(
-    audio_path: str,
-    source_lang: str = "en",
-    target_lang: str = "en", 
-    task: str = "transcribe",
-    timestamps: bool = True,
-    output_file: str = None,
-    include_confidence: bool = True,
-    preserve_formatting: bool = True,
-):
-    """
-    Transcribe or translate audio using NVIDIA Canary model.
-    """
-    # Get the directory where this script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(script_dir, "canary-1b-v2.nemo")
-    
-    if not os.path.exists(model_path):
-        print(f"Error: Model file not found: {model_path}")
-        sys.exit(1)
-    
-    print(f"Loading NVIDIA Canary model from: {model_path}")
-    asr_model = nemo_asr.models.ASRModel.restore_from(model_path)
-    
-    print(f"Processing: {audio_path}")
-    print(f"Task: {task}")
-    print(f"Source language: {source_lang}")
-    print(f"Target language: {target_lang}")
-    
-    if timestamps:
-        if task == "translate" and source_lang != target_lang:
-            # Translation with timestamps
-            output = asr_model.transcribe(
-                [audio_path], 
-                source_lang=source_lang,
-                target_lang=target_lang,
-                timestamps=True
-            )
-        else:
-            # Transcription with timestamps
-            output = asr_model.transcribe(
-                [audio_path],
-                source_lang=source_lang,
-                target_lang=target_lang,
-                timestamps=True
-            )
-        
-        # Extract text and timestamps
-        result_data = output[0]
-        text = result_data.text
-        word_timestamps = result_data.timestamp.get("word", [])
-        segment_timestamps = result_data.timestamp.get("segment", [])
-        
-        print(f"Result: {text}")
-        
-        # Prepare output data
-        output_data = {
-            "transcription": text,
-            "source_language": source_lang,
-            "target_language": target_lang,
-            "task": task,
-            "word_timestamps": word_timestamps,
-            "segment_timestamps": segment_timestamps,
-            "audio_file": audio_path,
-            "model": "canary-1b-v2"
-        }
-        
-        if include_confidence:
-            # Add confidence scores if available
-            if hasattr(result_data, 'confidence') and result_data.confidence:
-                output_data["confidence"] = result_data.confidence
-        
-        # Save to file
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
-            print(f"Results saved to: {output_file}")
-        else:
-            print(json.dumps(output_data, indent=2, ensure_ascii=False))
-    
-    else:
-        # Simple transcription/translation without timestamps
-        if task == "translate" and source_lang != target_lang:
-            output = asr_model.transcribe(
-                [audio_path],
-                source_lang=source_lang,
-                target_lang=target_lang
-            )
-        else:
-            output = asr_model.transcribe(
-                [audio_path],
-                source_lang=source_lang,
-                target_lang=target_lang
-            )
-        
-        text = output[0].text
-        
-        output_data = {
-            "transcription": text,
-            "source_language": source_lang,
-            "target_language": target_lang,
-            "task": task,
-            "audio_file": audio_path,
-            "model": "canary-1b-v2"
-        }
-        
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
-            print(f"Results saved to: {output_file}")
-        else:
-            print(json.dumps(output_data, indent=2, ensure_ascii=False))
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Transcribe or translate audio using NVIDIA Canary model"
-    )
-    parser.add_argument("audio_file", help="Path to audio file")
-    parser.add_argument(
-        "--source-lang", default="en",
-        choices=["en", "de", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt", "ru", "zh"],
-        help="Source language (default: en)"
-    )
-    parser.add_argument(
-        "--target-lang", default="en",
-        choices=["en", "de", "es", "fr", "hi", "it", "ja", "ko", "pl", "pt", "ru", "zh"],
-        help="Target language (default: en)"
-    )
-    parser.add_argument(
-        "--task", choices=["transcribe", "translate"], default="transcribe",
-        help="Task to perform (default: transcribe)"
-    )
-    parser.add_argument(
-        "--timestamps", action="store_true", default=True,
-        help="Include word and segment level timestamps"
-    )
-    parser.add_argument(
-        "--no-timestamps", dest="timestamps", action="store_false",
-        help="Disable timestamps"
-    )
-    parser.add_argument(
-        "--output", "-o", help="Output file path"
-    )
-    parser.add_argument(
-        "--include-confidence", action="store_true", default=True,
-        help="Include confidence scores"
-    )
-    parser.add_argument(
-        "--no-confidence", dest="include_confidence", action="store_false",
-        help="Exclude confidence scores"
-    )
-    parser.add_argument(
-        "--preserve-formatting", action="store_true", default=True,
-        help="Preserve punctuation and capitalization"
-    )
-    
-    args = parser.parse_args()
-    
-    # Validate input file
-    if not os.path.exists(args.audio_file):
-        print(f"Error: Audio file not found: {args.audio_file}")
-        sys.exit(1)
-    
-    try:
-        transcribe_audio(
-            audio_path=args.audio_file,
-            source_lang=args.source_lang,
-            target_lang=args.target_lang,
-            task=args.task,
-            timestamps=args.timestamps,
-            output_file=args.output,
-            include_confidence=args.include_confidence,
-            preserve_formatting=args.preserve_formatting,
-        )
-    except Exception as e:
-        print(f"Error during transcription: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
-`
-
-	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+	scriptPath := filepath.Join(c.envPath, "canary_transcribe.py")
+	if err := os.WriteFile(scriptPath, scriptContent, 0755); err != nil {
 		return fmt.Errorf("failed to write transcription script: %w", err)
 	}
 
@@ -549,17 +341,36 @@ func (c *CanaryAdapter) Transcribe(ctx context.Context, input interfaces.AudioIn
 
 	// Execute Canary
 	cmd := exec.CommandContext(ctx, "uv", args...)
-	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+	cmd.Env = append(os.Environ(),
+		"PYTHONUNBUFFERED=1",
+		"PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+
+	// Setup log file
+	logFile, err := os.OpenFile(filepath.Join(procCtx.OutputDirectory, "transcription.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logger.Warn("Failed to create log file", "error", err)
+	} else {
+		defer logFile.Close()
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
 
 	logger.Info("Executing Canary command", "args", strings.Join(args, " "))
-	
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.Canceled {
-		return nil, fmt.Errorf("transcription was cancelled")
-	}
-	if err != nil {
-		logger.Error("Canary execution failed", "output", string(output), "error", err)
-		return nil, fmt.Errorf("Canary execution failed: %w", err)
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.Canceled {
+			return nil, fmt.Errorf("transcription was cancelled")
+		}
+
+		// Read tail of log file for context
+		logPath := filepath.Join(procCtx.OutputDirectory, "transcription.log")
+		logTail, readErr := c.ReadLogTail(logPath, 2048)
+		if readErr != nil {
+			logger.Warn("Failed to read log tail", "error", readErr)
+		}
+
+		logger.Error("Canary execution failed", "error", err)
+		return nil, fmt.Errorf("Canary execution failed: %w\nLogs:\n%s", err, logTail)
 	}
 
 	// Parse result
@@ -572,7 +383,7 @@ func (c *CanaryAdapter) Transcribe(ctx context.Context, input interfaces.AudioIn
 	result.ModelUsed = "canary-1b-v2"
 	result.Metadata = c.CreateDefaultMetadata(params)
 
-	logger.Info("Canary transcription completed", 
+	logger.Info("Canary transcription completed",
 		"segments", len(result.Segments),
 		"words", len(result.WordSegments),
 		"processing_time", result.ProcessingTime,
@@ -584,7 +395,7 @@ func (c *CanaryAdapter) Transcribe(ctx context.Context, input interfaces.AudioIn
 // buildCanaryArgs builds the command arguments for Canary
 func (c *CanaryAdapter) buildCanaryArgs(input interfaces.AudioInput, params map[string]interface{}, tempDir string) ([]string, error) {
 	outputFile := filepath.Join(tempDir, "result.json")
-	
+
 	scriptPath := filepath.Join(c.envPath, "canary_transcribe.py")
 	args := []string{
 		"run", "--native-tls", "--project", c.envPath, "python", scriptPath,
@@ -622,18 +433,18 @@ func (c *CanaryAdapter) buildCanaryArgs(input interfaces.AudioInput, params map[
 // parseResult parses the Canary output
 func (c *CanaryAdapter) parseResult(tempDir string, input interfaces.AudioInput, params map[string]interface{}) (*interfaces.TranscriptResult, error) {
 	resultFile := filepath.Join(tempDir, "result.json")
-	
+
 	data, err := os.ReadFile(resultFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read result file: %w", err)
 	}
 
 	var canaryResult struct {
-		Transcription     string `json:"transcription"`
-		SourceLanguage    string `json:"source_language"`
-		TargetLanguage    string `json:"target_language"`
-		Task              string `json:"task"`
-		WordTimestamps    []struct {
+		Transcription  string `json:"transcription"`
+		SourceLanguage string `json:"source_language"`
+		TargetLanguage string `json:"target_language"`
+		Task           string `json:"task"`
+		WordTimestamps []struct {
 			Word        string  `json:"word"`
 			StartOffset int     `json:"start_offset"`
 			EndOffset   int     `json:"end_offset"`
@@ -662,11 +473,11 @@ func (c *CanaryAdapter) parseResult(tempDir string, input interfaces.AudioInput,
 
 	// Convert to standard format
 	result := &interfaces.TranscriptResult{
-		Text:       canaryResult.Transcription,
-		Language:   resultLanguage,
-		Segments:   make([]interfaces.TranscriptSegment, len(canaryResult.SegmentTimestamps)),
+		Text:         canaryResult.Transcription,
+		Language:     resultLanguage,
+		Segments:     make([]interfaces.TranscriptSegment, len(canaryResult.SegmentTimestamps)),
 		WordSegments: make([]interfaces.TranscriptWord, len(canaryResult.WordTimestamps)),
-		Confidence: 0.0, // Default confidence
+		Confidence:   0.0, // Default confidence
 	}
 
 	// Convert segments
@@ -696,12 +507,7 @@ func (c *CanaryAdapter) parseResult(tempDir string, input interfaces.AudioInput,
 func (c *CanaryAdapter) GetEstimatedProcessingTime(input interfaces.AudioInput) time.Duration {
 	// Canary is typically slower than Parakeet due to its multilingual capabilities
 	baseTime := c.BaseAdapter.GetEstimatedProcessingTime(input)
-	
+
 	// Canary typically processes at about 40-50% of audio duration
 	return time.Duration(float64(baseTime) * 2.0)
-}
-
-// init registers the Canary adapter
-func init() {
-	registry.RegisterTranscriptionAdapter("canary", NewCanaryAdapter())
 }

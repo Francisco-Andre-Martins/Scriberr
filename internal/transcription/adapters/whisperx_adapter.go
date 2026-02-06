@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"scriberr/internal/transcription/interfaces"
-	"scriberr/internal/transcription/registry"
 	"scriberr/pkg/logger"
 )
 
@@ -23,9 +22,7 @@ type WhisperXAdapter struct {
 }
 
 // NewWhisperXAdapter creates a new WhisperX adapter
-func NewWhisperXAdapter() *WhisperXAdapter {
-	envPath := "whisperx-env"
-	
+func NewWhisperXAdapter(envPath string) *WhisperXAdapter {
 	capabilities := interfaces.ModelCapabilities{
 		ModelID:     "whisperx",
 		ModelFamily: "whisper",
@@ -42,22 +39,22 @@ func NewWhisperXAdapter() *WhisperXAdapter {
 			"uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg",
 			"as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "auto",
 		},
-		SupportedFormats: []string{"wav", "mp3", "flac", "m4a", "ogg", "wma"},
-		RequiresGPU:      false, // Optional GPU support
-		MemoryRequirement: 2048, // 2GB base requirement
+		SupportedFormats:  []string{"wav", "mp3", "flac", "m4a", "ogg", "wma"},
+		RequiresGPU:       false, // Optional GPU support
+		MemoryRequirement: 2048,  // 2GB base requirement
 		Features: map[string]bool{
-			"timestamps":     true,
-			"word_level":     true,
-			"diarization":    true,
-			"translation":    true,
+			"timestamps":         true,
+			"word_level":         true,
+			"diarization":        true,
+			"translation":        true,
 			"language_detection": true,
-			"vad":            true,
+			"vad":                true,
 		},
 		Metadata: map[string]string{
-			"engine":      "openai_whisper",
-			"framework":   "transformers",
-			"license":     "MIT",
-			"python_env":  "whisperx",
+			"engine":     "openai_whisper",
+			"framework":  "transformers",
+			"license":    "MIT",
+			"python_env": "whisperx",
 		},
 	}
 
@@ -72,7 +69,7 @@ func NewWhisperXAdapter() *WhisperXAdapter {
 			Description: "Whisper model size to use",
 			Group:       "basic",
 		},
-		
+
 		// Device and computation
 		{
 			Name:        "device",
@@ -185,7 +182,7 @@ func NewWhisperXAdapter() *WhisperXAdapter {
 			Type:        "string",
 			Required:    false,
 			Default:     nil,
-			Description: "HuggingFace token for diarization models",
+			Description: "HuggingFace token for diarization models (optional if HF_TOKEN env var is set)",
 			Group:       "advanced",
 		},
 
@@ -261,10 +258,20 @@ func NewWhisperXAdapter() *WhisperXAdapter {
 			Description: "VAD offset threshold",
 			Group:       "advanced",
 		},
+
+		// Custom Alignment Model
+		{
+			Name:        "align_model",
+			Type:        "string",
+			Required:    false,
+			Default:     nil,
+			Description: "Custom alignment model (e.g. KBLab/wav2vec2-large-voxrex-swedish)",
+			Group:       "advanced",
+		},
 	}
 
 	baseAdapter := NewBaseAdapter("whisperx", filepath.Join(envPath, "WhisperX"), capabilities, schema)
-	
+
 	adapter := &WhisperXAdapter{
 		BaseAdapter: baseAdapter,
 		envPath:     envPath,
@@ -277,7 +284,7 @@ func NewWhisperXAdapter() *WhisperXAdapter {
 func (w *WhisperXAdapter) GetSupportedModels() []string {
 	return []string{
 		"tiny", "tiny.en",
-		"base", "base.en", 
+		"base", "base.en",
 		"small", "small.en",
 		"medium", "medium.en",
 		"large", "large-v1", "large-v2", "large-v3",
@@ -289,7 +296,7 @@ func (w *WhisperXAdapter) PrepareEnvironment(ctx context.Context) error {
 	logger.Info("Preparing WhisperX environment", "env_path", w.envPath)
 
 	whisperxPath := filepath.Join(w.envPath, "WhisperX")
-	
+
 	// Check if WhisperX is already set up and working (using cache to speed up repeated checks)
 	if CheckEnvironmentReady(whisperxPath, "import whisperx") {
 		logger.Info("WhisperX environment already ready")
@@ -349,8 +356,13 @@ func (w *WhisperXAdapter) updateWhisperXDependencies(whisperxPath string) error 
 		content = strings.ReplaceAll(content,
 			`"transformers>=4.48.0",`,
 			`"transformers>=4.48.0",
-    "yt-dlp",`)
+    "yt-dlp[default]",`)
 	}
+
+	// Set PyTorch CUDA version based on environment configuration
+	// The repo already has the correct [tool.uv.sources] configuration, we just need to update the CUDA version
+	// This allows using cu126 for legacy GPUs (GTX 10-series through RTX 40-series) or cu128 for Blackwell (RTX 50-series)
+	content = strings.ReplaceAll(content, "https://download.pytorch.org/whl/cu128", GetPyTorchWheelURL())
 
 	if err := os.WriteFile(pyprojectPath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("failed to write pyproject.toml: %w", err)
@@ -403,17 +415,59 @@ func (w *WhisperXAdapter) Transcribe(ctx context.Context, input interfaces.Audio
 
 	// Execute WhisperX
 	cmd := exec.CommandContext(ctx, "uv", args...)
-	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
+
+	// Add nvidia libraries to LD_LIBRARY_PATH
+	env := os.Environ()
+	if nvidiaPaths, err := w.findNvidiaLibPaths(); err == nil && len(nvidiaPaths) > 0 {
+		ldLibraryPath := os.Getenv("LD_LIBRARY_PATH")
+		newPath := strings.Join(nvidiaPaths, string(os.PathListSeparator))
+		if ldLibraryPath != "" {
+			newPath = newPath + string(os.PathListSeparator) + ldLibraryPath
+		}
+
+		// Update LD_LIBRARY_PATH in env
+		found := false
+		for i, e := range env {
+			if strings.HasPrefix(e, "LD_LIBRARY_PATH=") {
+				env[i] = "LD_LIBRARY_PATH=" + newPath
+				found = true
+				break
+			}
+		}
+		if !found {
+			env = append(env, "LD_LIBRARY_PATH="+newPath)
+		}
+		logger.Debug("Updated LD_LIBRARY_PATH for WhisperX", "path", newPath)
+	}
+
+	cmd.Env = append(env, "PYTHONUNBUFFERED=1")
+
+	// Setup log file
+	logFile, err := os.OpenFile(filepath.Join(procCtx.OutputDirectory, "transcription.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		logger.Warn("Failed to create log file", "error", err)
+	} else {
+		defer logFile.Close()
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
 
 	logger.Info("Executing WhisperX command", "args", strings.Join(args, " "))
-	
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.Canceled {
-		return nil, fmt.Errorf("transcription was cancelled")
-	}
-	if err != nil {
-		logger.Error("WhisperX execution failed", "output", string(output), "error", err)
-		return nil, fmt.Errorf("WhisperX execution failed: %w", err)
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.Canceled {
+			return nil, fmt.Errorf("transcription was cancelled")
+		}
+
+		// Read tail of log file for context
+		logPath := filepath.Join(procCtx.OutputDirectory, "transcription.log")
+		logTail, readErr := w.ReadLogTail(logPath, 2048)
+		if readErr != nil {
+			logger.Warn("Failed to read log tail", "error", readErr)
+		}
+
+		logger.Error("WhisperX execution failed", "error", err)
+		return nil, fmt.Errorf("WhisperX execution failed: %w\nLogs:\n%s", err, logTail)
 	}
 
 	// Parse result
@@ -426,7 +480,7 @@ func (w *WhisperXAdapter) Transcribe(ctx context.Context, input interfaces.Audio
 	result.ModelUsed = w.GetStringParameter(params, "model")
 	result.Metadata = w.CreateDefaultMetadata(params)
 
-	logger.Info("WhisperX transcription completed", 
+	logger.Info("WhisperX transcription completed",
 		"segments", len(result.Segments),
 		"words", len(result.WordSegments),
 		"processing_time", result.ProcessingTime)
@@ -437,7 +491,7 @@ func (w *WhisperXAdapter) Transcribe(ctx context.Context, input interfaces.Audio
 // buildWhisperXArgs builds the command arguments for WhisperX
 func (w *WhisperXAdapter) buildWhisperXArgs(input interfaces.AudioInput, params map[string]interface{}, outputDir string) ([]string, error) {
 	whisperxPath := filepath.Join(w.envPath, "WhisperX")
-	
+
 	args := []string{
 		"run", "--native-tls", "--project", whisperxPath, "python", "-m", "whisperx",
 		input.FilePath,
@@ -450,7 +504,7 @@ func (w *WhisperXAdapter) buildWhisperXArgs(input interfaces.AudioInput, params 
 	args = append(args, "--device_index", strconv.Itoa(w.GetIntParameter(params, "device_index")))
 	args = append(args, "--batch_size", strconv.Itoa(w.GetIntParameter(params, "batch_size")))
 	args = append(args, "--compute_type", w.GetStringParameter(params, "compute_type"))
-	
+
 	if threads := w.GetIntParameter(params, "threads"); threads > 0 {
 		args = append(args, "--threads", strconv.Itoa(threads))
 	}
@@ -470,16 +524,21 @@ func (w *WhisperXAdapter) buildWhisperXArgs(input interfaces.AudioInput, params 
 	args = append(args, "--vad_onset", fmt.Sprintf("%.3f", w.GetFloatParameter(params, "vad_onset")))
 	args = append(args, "--vad_offset", fmt.Sprintf("%.3f", w.GetFloatParameter(params, "vad_offset")))
 
+	// Custom alignment model
+	if alignModel := w.GetStringParameter(params, "align_model"); alignModel != "" {
+		args = append(args, "--align_model", alignModel)
+	}
+
 	// Diarization
 	if w.GetBoolParameter(params, "diarize") {
 		args = append(args, "--diarize")
-		
+
 		diarizeModel := w.GetStringParameter(params, "diarize_model")
 		if diarizeModel == "pyannote" {
 			diarizeModel = "pyannote/speaker-diarization-3.1"
 		}
 		args = append(args, "--diarize_model", diarizeModel)
-		
+
 		if minSpeakers := w.GetIntParameter(params, "min_speakers"); minSpeakers > 0 {
 			args = append(args, "--min_speakers", strconv.Itoa(minSpeakers))
 		}
@@ -494,8 +553,12 @@ func (w *WhisperXAdapter) buildWhisperXArgs(input interfaces.AudioInput, params 
 	args = append(args, "--beam_size", strconv.Itoa(w.GetIntParameter(params, "beam_size")))
 	args = append(args, "--patience", fmt.Sprintf("%.2f", w.GetFloatParameter(params, "patience")))
 
-	// HuggingFace token
-	if hfToken := w.GetStringParameter(params, "hf_token"); hfToken != "" {
+	// HuggingFace token - use param first, then fall back to environment variable
+	hfToken := w.GetStringParameter(params, "hf_token")
+	if hfToken == "" {
+		hfToken = os.Getenv("HF_TOKEN")
+	}
+	if hfToken != "" {
 		args = append(args, "--hf_token", hfToken)
 	}
 
@@ -519,7 +582,7 @@ func (w *WhisperXAdapter) parseResult(outputDir string, input interfaces.AudioIn
 
 	// Use the first JSON file found
 	resultFile := files[0]
-	
+
 	data, err := os.ReadFile(resultFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read result file: %w", err)
@@ -550,10 +613,10 @@ func (w *WhisperXAdapter) parseResult(outputDir string, input interfaces.AudioIn
 
 	// Convert to standard format
 	result := &interfaces.TranscriptResult{
-		Language:   whisperxResult.Language,
-		Segments:   make([]interfaces.TranscriptSegment, len(whisperxResult.Segments)),
+		Language:     whisperxResult.Language,
+		Segments:     make([]interfaces.TranscriptSegment, len(whisperxResult.Segments)),
 		WordSegments: make([]interfaces.TranscriptWord, len(whisperxResult.Word)),
-		Confidence: 0.0, // WhisperX doesn't provide overall confidence
+		Confidence:   0.0, // WhisperX doesn't provide overall confidence
 	}
 
 	// Convert segments
@@ -593,14 +656,40 @@ func (w *WhisperXAdapter) parseResult(outputDir string, input interfaces.AudioIn
 func (w *WhisperXAdapter) GetEstimatedProcessingTime(input interfaces.AudioInput) time.Duration {
 	// WhisperX processing time varies by model size
 	baseTime := w.BaseAdapter.GetEstimatedProcessingTime(input)
-	
+
 	// Adjust based on model size (if we can determine it)
 	// This would need model size information from parameters
 	// For now, use base estimation
 	return baseTime
 }
 
-// init registers the WhisperX adapter
-func init() {
-	registry.RegisterTranscriptionAdapter("whisperx", NewWhisperXAdapter())
+// findNvidiaLibPaths searches for nvidia library paths in the virtual environment
+func (w *WhisperXAdapter) findNvidiaLibPaths() ([]string, error) {
+	whisperxPath := filepath.Join(w.envPath, "WhisperX")
+
+	// Find site-packages
+	matches, err := filepath.Glob(filepath.Join(whisperxPath, ".venv", "lib", "python*", "site-packages"))
+	if err != nil || len(matches) == 0 {
+		return nil, fmt.Errorf("could not find site-packages: %v", err)
+	}
+	sitePackages := matches[0]
+
+	// Find all nvidia/*/lib directories
+	libMatches, err := filepath.Glob(filepath.Join(sitePackages, "nvidia", "*", "lib"))
+	if err != nil {
+		return nil, err
+	}
+
+	// Also include the base site-packages/nvidia directory if needed, sometimes libs are there
+	// But usually they are in nvidia/<component>/lib
+
+	// Filter out any matches that are not directories
+	var paths []string
+	for _, match := range libMatches {
+		if info, err := os.Stat(match); err == nil && info.IsDir() {
+			paths = append(paths, match)
+		}
+	}
+
+	return paths, nil
 }

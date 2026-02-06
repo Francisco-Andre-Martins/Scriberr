@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"scriberr/internal/transcription/interfaces"
-	"scriberr/internal/transcription/registry"
+	"scriberr/pkg/downloader"
 	"scriberr/pkg/logger"
 )
 
@@ -23,9 +23,7 @@ type SortformerAdapter struct {
 }
 
 // NewSortformerAdapter creates a new NVIDIA Sortformer diarization adapter
-func NewSortformerAdapter() *SortformerAdapter {
-	envPath := "whisperx-env/parakeet" // Shares environment with NVIDIA models
-	
+func NewSortformerAdapter(envPath string) *SortformerAdapter {
 	capabilities := interfaces.ModelCapabilities{
 		ModelID:            "sortformer",
 		ModelFamily:        "nvidia_sortformer",
@@ -44,13 +42,13 @@ func NewSortformerAdapter() *SortformerAdapter {
 			"no_token_required":    true,
 		},
 		Metadata: map[string]string{
-			"engine":        "nvidia_nemo",
-			"framework":     "nemo_toolkit",
-			"license":       "CC-BY-4.0",
-			"optimization":  "4_speakers",
-			"sample_rate":   "16000",
-			"format":        "16khz_mono_wav",
-			"no_auth":       "true",
+			"engine":       "nvidia_nemo",
+			"framework":    "nemo_toolkit",
+			"license":      "CC-BY-4.0",
+			"optimization": "4_speakers",
+			"sample_rate":  "16000",
+			"format":       "16khz_mono_wav",
+			"no_auth":      "true",
 		},
 	}
 
@@ -83,7 +81,7 @@ func NewSortformerAdapter() *SortformerAdapter {
 			Type:        "string",
 			Required:    false,
 			Default:     "rttm",
-			Options:     []string{"rttm", "json"},
+			Options:     []string{"rttm", OutputFormatJSON},
 			Description: "Output format for diarization results",
 			Group:       "advanced",
 		},
@@ -95,7 +93,7 @@ func NewSortformerAdapter() *SortformerAdapter {
 			Required:    false,
 			Default:     "auto",
 			Options:     []string{"cpu", "cuda", "auto"},
-			Description: "Device to use for computation",
+			Description: "Device to use for computation (cpu, cuda for NVIDIA GPUs, auto for automatic detection)",
 			Group:       "advanced",
 		},
 
@@ -131,7 +129,7 @@ func NewSortformerAdapter() *SortformerAdapter {
 	}
 
 	baseAdapter := NewBaseAdapter("sortformer", envPath, capabilities, schema)
-	
+
 	adapter := &SortformerAdapter{
 		BaseAdapter: baseAdapter,
 		envPath:     envPath,
@@ -153,6 +151,11 @@ func (s *SortformerAdapter) GetMinSpeakers() int {
 // PrepareEnvironment sets up the Sortformer environment (shared with NVIDIA models)
 func (s *SortformerAdapter) PrepareEnvironment(ctx context.Context) error {
 	logger.Info("Preparing NVIDIA Sortformer environment", "env_path", s.envPath)
+
+	// Copy diarization script
+	if err := s.copyDiarizationScript(); err != nil {
+		return fmt.Errorf("failed to copy diarization script: %w", err)
+	}
 
 	// Check if environment is already ready (using cache to speed up repeated checks)
 	if CheckEnvironmentReady(s.envPath, "from nemo.collections.asr.models import SortformerEncLabelModel") {
@@ -181,11 +184,6 @@ func (s *SortformerAdapter) PrepareEnvironment(ctx context.Context) error {
 		return fmt.Errorf("failed to download Sortformer model: %w", err)
 	}
 
-	// Create diarization script
-	if err := s.createDiarizationScript(); err != nil {
-		return fmt.Errorf("failed to create diarization script: %w", err)
-	}
-
 	s.initialized = true
 	logger.Info("Sortformer environment prepared successfully")
 	return nil
@@ -197,28 +195,23 @@ func (s *SortformerAdapter) setupSortformerEnvironment() error {
 		return fmt.Errorf("failed to create sortformer directory: %w", err)
 	}
 
-	// Create pyproject.toml (same as other NVIDIA models)
-	pyprojectContent := `[project]
-name = "parakeet-transcription"
-version = "0.1.0"
-description = "Audio transcription using NVIDIA Parakeet models"
-requires-python = ">=3.11"
-dependencies = [
-    "nemo-toolkit[asr]",
-    "torch",
-    "torchaudio",
-    "librosa",
-    "soundfile",
-    "ml-dtypes>=0.3.1,<0.5.0",
-    "onnx>=1.15.0,<1.18.0",
-    "pyannote.audio"
-]
+	// Read pyproject.toml
+	pyprojectContent, err := nvidiaScripts.ReadFile("py/nvidia/pyproject.toml")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded pyproject.toml: %w", err)
+	}
 
-[tool.uv.sources]
-nemo-toolkit = { git = "https://github.com/NVIDIA/NeMo.git" }
-`
+	// Replace the hardcoded PyTorch URL with the dynamic one based on environment
+	// The static file contains the default cu126 URL
+	contentStr := strings.Replace(
+		string(pyprojectContent),
+		"https://download.pytorch.org/whl/cu126",
+		GetPyTorchWheelURL(),
+		1,
+	)
+
 	pyprojectPath := filepath.Join(s.envPath, "pyproject.toml")
-	if err := os.WriteFile(pyprojectPath, []byte(pyprojectContent), 0644); err != nil {
+	if err := os.WriteFile(pyprojectPath, []byte(contentStr), 0644); err != nil {
 		return fmt.Errorf("failed to write pyproject.toml: %w", err)
 	}
 
@@ -246,28 +239,14 @@ func (s *SortformerAdapter) downloadSortformerModel() error {
 	}
 
 	logger.Info("Downloading Sortformer model", "path", modelPath)
-	
+
 	modelURL := "https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2/resolve/main/diar_streaming_sortformer_4spk-v2.nemo?download=true"
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	tempPath := modelPath + ".tmp"
-	os.Remove(tempPath)
-
-	cmd := exec.CommandContext(ctx, "curl",
-		"-L", "-#", "--max-time", "1800",
-		"-o", tempPath, modelURL)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to download Sortformer model: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	if err := os.Rename(tempPath, modelPath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to move downloaded model: %w", err)
+	if err := downloader.DownloadFile(ctx, modelURL, modelPath); err != nil {
+		return fmt.Errorf("failed to download Sortformer model: %w", err)
 	}
 
 	stat, err := os.Stat(modelPath)
@@ -282,341 +261,20 @@ func (s *SortformerAdapter) downloadSortformerModel() error {
 	return nil
 }
 
-// createDiarizationScript creates the Python script for Sortformer diarization
-func (s *SortformerAdapter) createDiarizationScript() error {
-	scriptPath := filepath.Join(s.envPath, "sortformer_diarize.py")
-	
-	// Check if script already exists
-	if _, err := os.Stat(scriptPath); err == nil {
-		return nil
+// copyDiarizationScript creates the Python script for Sortformer diarization
+func (s *SortformerAdapter) copyDiarizationScript() error {
+	// Ensure directory exists before writing script
+	if err := os.MkdirAll(s.envPath, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	scriptContent := `#!/usr/bin/env python3
-"""
-NVIDIA Sortformer speaker diarization script.
-Uses diar_streaming_sortformer_4spk-v2 for optimized 4-speaker diarization.
-"""
+	scriptContent, err := nvidiaScripts.ReadFile("py/nvidia/sortformer_diarize.py")
+	if err != nil {
+		return fmt.Errorf("failed to read embedded sortformer_diarize.py: %w", err)
+	}
 
-import argparse
-import json
-import sys
-import os
-from pathlib import Path
-import torch
-
-try:
-    from nemo.collections.asr.models import SortformerEncLabelModel
-except ImportError:
-    print("Error: NeMo not found. Please install nemo_toolkit[asr]")
-    sys.exit(1)
-
-
-def diarize_audio(
-    audio_path: str,
-    output_file: str,
-    batch_size: int = 1,
-    device: str = None,
-    max_speakers: int = 4,
-    output_format: str = "rttm",
-    streaming_mode: bool = False,
-    chunk_length_s: float = 30.0,
-):
-    """
-    Perform speaker diarization using NVIDIA's Sortformer model.
-    """
-    if device is None or device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print(f"Using device: {device}")
-    print(f"Loading NVIDIA Sortformer diarization model...")
-
-    # Get the directory where this script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(script_dir, "diar_streaming_sortformer_4spk-v2.nemo")
-
-    try:
-        if not os.path.exists(model_path):
-            print(f"Error: Model file not found: {model_path}")
-            print("Please ensure diar_streaming_sortformer_4spk-v2.nemo is in the same directory as this script")
-            sys.exit(1)
-
-        # Load from local file
-        print(f"Loading model from local path: {model_path}")
-        diar_model = SortformerEncLabelModel.restore_from(
-            restore_path=model_path,
-            map_location=device,
-            strict=False,
-        )
-
-        # Switch to inference mode
-        diar_model.eval()
-        print("Model loaded successfully")
-
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        sys.exit(1)
-
-    print(f"Processing audio file: {audio_path}")
-
-    # Verify audio file exists
-    if not os.path.exists(audio_path):
-        print(f"Error: Audio file not found: {audio_path}")
-        sys.exit(1)
-
-    try:
-        # Run diarization
-        print(f"Running diarization with batch_size={batch_size}, max_speakers={max_speakers}")
-        
-        if streaming_mode:
-            print(f"Using streaming mode with chunk_length_s={chunk_length_s}")
-            # Note: Streaming mode implementation would go here
-            # For now, use standard diarization
-            predicted_segments = diar_model.diarize(audio=audio_path, batch_size=batch_size)
-        else:
-            predicted_segments = diar_model.diarize(audio=audio_path, batch_size=batch_size)
-
-        print(f"Diarization completed. Found segments: {len(predicted_segments)}")
-
-        # Process and save results
-        save_results(predicted_segments, output_file, audio_path, output_format)
-
-    except Exception as e:
-        print(f"Error during diarization: {e}")
-        sys.exit(1)
-
-
-def save_results(segments, output_file: str, audio_path: str, output_format: str):
-    """
-    Save diarization results to output file.
-    Supports both JSON and RTTM formats based on output_format parameter.
-    """
-    output_path = Path(output_file)
-
-    if output_format == "rttm":
-        save_rttm_format(segments, output_file, audio_path)
-    else:
-        save_json_format(segments, output_file, audio_path)
-
-
-def save_json_format(segments, output_file: str, audio_path: str):
-    """Save results in JSON format."""
-    results = {
-        "audio_file": audio_path,
-        "model": "nvidia/diar_streaming_sortformer_4spk-v2",
-        "segments": [],
-    }
-
-    # Handle the case where segments is a list containing a single list of string entries
-    if len(segments) == 1 and isinstance(segments[0], list):
-        segments = segments[0]
-
-    # Convert segments to JSON format
-    speakers = set()
-    for i, segment in enumerate(segments):
-        try:
-            # Handle different possible segment formats
-            if isinstance(segment, str):
-                # String format: "start end speaker_id"
-                parts = segment.strip().split()
-                if len(parts) >= 3:
-                    segment_data = {
-                        "start": float(parts[0]),
-                        "end": float(parts[1]),
-                        "speaker": str(parts[2]),
-                        "duration": float(parts[1]) - float(parts[0]),
-                        "confidence": 1.0,
-                    }
-                else:
-                    print(f"Warning: Invalid string segment format: {segment}")
-                    continue
-            elif hasattr(segment, 'start') and hasattr(segment, 'end') and hasattr(segment, 'label'):
-                # Standard pyannote-like format
-                segment_data = {
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "speaker": str(segment.label),
-                    "duration": float(segment.end - segment.start),
-                    "confidence": getattr(segment, 'confidence', 1.0),
-                }
-            elif isinstance(segment, (list, tuple)) and len(segment) >= 3:
-                # List/tuple format: [start, end, speaker]
-                segment_data = {
-                    "start": float(segment[0]),
-                    "end": float(segment[1]),
-                    "speaker": str(segment[2]),
-                    "duration": float(segment[1] - segment[0]),
-                    "confidence": 1.0,
-                }
-            elif isinstance(segment, dict):
-                # Dictionary format
-                segment_data = {
-                    "start": float(segment.get('start', 0)),
-                    "end": float(segment.get('end', 0)),
-                    "speaker": str(segment.get('speaker', segment.get('label', f'speaker_{i}'))),
-                    "duration": float(segment.get('end', 0) - segment.get('start', 0)),
-                    "confidence": float(segment.get('confidence', 1.0)),
-                }
-            else:
-                # Fallback: try to extract attributes dynamically
-                segment_data = {
-                    "start": float(getattr(segment, 'start', 0)),
-                    "end": float(getattr(segment, 'end', 0)),
-                    "speaker": str(getattr(segment, 'label', getattr(segment, 'speaker', f'speaker_{i}'))),
-                    "duration": float(getattr(segment, 'end', 0) - getattr(segment, 'start', 0)),
-                    "confidence": float(getattr(segment, 'confidence', 1.0)),
-                }
-
-            results["segments"].append(segment_data)
-            speakers.add(segment_data["speaker"])
-
-        except Exception as e:
-            print(f"Warning: Could not process segment {i}: {e}")
-            print(f"Segment: {segment}")
-
-    # Sort by start time
-    if results["segments"]:
-        results["segments"].sort(key=lambda x: x["start"])
-
-    # Add summary statistics
-    results["speakers"] = sorted(speakers)
-    results["speaker_count"] = len(speakers)
-    results["total_segments"] = len(results["segments"])
-    results["total_duration"] = max(seg["end"] for seg in results["segments"]) if results["segments"] else 0
-
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"Results saved to: {output_file}")
-    print(f"Found {len(speakers)} speakers: {', '.join(sorted(speakers))}")
-
-
-def save_rttm_format(segments, output_file: str, audio_path: str):
-    """Save results in RTTM (Rich Transcription Time Marked) format."""
-    audio_filename = Path(audio_path).stem
-    speakers = set()
-
-    # Handle the case where segments is a list containing a single list of string entries
-    if len(segments) == 1 and isinstance(segments[0], list):
-        segments = segments[0]
-
-    with open(output_file, "w") as f:
-        for i, segment in enumerate(segments):
-            try:
-                # Handle different possible segment formats
-                if isinstance(segment, str):
-                    # String format: "start end speaker_id"
-                    parts = segment.strip().split()
-                    if len(parts) >= 3:
-                        start = float(parts[0])
-                        end = float(parts[1])
-                        speaker = str(parts[2])
-                    else:
-                        print(f"Warning: Invalid string segment format: {segment}")
-                        continue
-                elif hasattr(segment, 'start') and hasattr(segment, 'end') and hasattr(segment, 'label'):
-                    # Standard pyannote-like format
-                    start = float(segment.start)
-                    end = float(segment.end)
-                    speaker = str(segment.label)
-                elif isinstance(segment, (list, tuple)) and len(segment) >= 3:
-                    # List/tuple format: [start, end, speaker]
-                    start = float(segment[0])
-                    end = float(segment[1])
-                    speaker = str(segment[2])
-                elif isinstance(segment, dict):
-                    # Dictionary format
-                    start = float(segment.get('start', 0))
-                    end = float(segment.get('end', 0))
-                    speaker = str(segment.get('speaker', segment.get('label', f'speaker_{i}')))
-                else:
-                    # Fallback: try to extract attributes dynamically
-                    start = float(getattr(segment, 'start', 0))
-                    end = float(getattr(segment, 'end', 0))
-                    speaker = str(getattr(segment, 'label', getattr(segment, 'speaker', f'speaker_{i}')))
-
-                duration = end - start
-                speakers.add(speaker)
-
-                # RTTM format: SPEAKER <filename> <channel> <start> <duration> <NA> <NA> <speaker_id> <NA> <NA>
-                line = f"SPEAKER {audio_filename} 1 {start:.3f} {duration:.3f} <NA> <NA> {speaker} <NA> <NA>\n"
-                f.write(line)
-
-            except Exception as e:
-                print(f"Warning: Could not process segment {i} for RTTM: {e}")
-                print(f"Segment: {segment}")
-
-    print(f"RTTM results saved to: {output_file}")
-    print(f"Found {len(speakers)} speakers: {', '.join(sorted(speakers))}")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Speaker diarization using NVIDIA Sortformer model (local model only)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Basic diarization with JSON output
-    python sortformer_diarize.py samples/sample.wav output.json
-    
-    # Generate RTTM format output
-    python sortformer_diarize.py samples/sample.wav output.rttm
-    
-    # Specify device and batch size
-    python sortformer_diarize.py --device cuda --batch-size 2 samples/sample.wav output.json
-
-Note: This script requires diar_streaming_sortformer_4spk-v2.nemo to be in the same directory.
-        """,
-    )
-
-    parser.add_argument("audio_file", help="Path to input audio file (WAV, FLAC, etc.)")
-    parser.add_argument("output_file", help="Path to output file (.json for JSON format, .rttm for RTTM format)")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for processing (default: 1)")
-    parser.add_argument("--device", choices=["cuda", "cpu", "auto"], default="auto", help="Device to use for inference (default: auto-detect)")
-    parser.add_argument("--max-speakers", type=int, default=4, help="Maximum number of speakers (default: 4, optimized for this model)")
-    parser.add_argument("--output-format", choices=["json", "rttm"], help="Output format (auto-detected from file extension if not specified)")
-    parser.add_argument("--streaming", action="store_true", help="Enable streaming mode")
-    parser.add_argument("--chunk-length-s", type=float, default=30.0, help="Chunk length in seconds for streaming mode (default: 30.0)")
-
-    args = parser.parse_args()
-
-    # Validate inputs
-    if not os.path.exists(args.audio_file):
-        print(f"Error: Audio file not found: {args.audio_file}")
-        sys.exit(1)
-
-    # Auto-detect output format from file extension if not specified
-    if args.output_format is None:
-        if args.output_file.lower().endswith('.rttm'):
-            output_format = "rttm"
-        else:
-            output_format = "json"
-    else:
-        output_format = args.output_format
-
-    # Create output directory if it doesn't exist
-    output_dir = Path(args.output_file).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    device = None if args.device == "auto" else args.device
-
-    # Run diarization
-    diarize_audio(
-        audio_path=args.audio_file,
-        output_file=args.output_file,
-        batch_size=args.batch_size,
-        device=device,
-        max_speakers=args.max_speakers,
-        output_format=output_format,
-        streaming_mode=args.streaming,
-        chunk_length_s=args.chunk_length_s,
-    )
-
-
-if __name__ == "__main__":
-    main()
-`
-
-	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+	scriptPath := filepath.Join(s.envPath, "sortformer_diarize.py")
+	if err := os.WriteFile(scriptPath, scriptContent, 0755); err != nil {
 		return fmt.Errorf("failed to write diarization script: %w", err)
 	}
 
@@ -669,15 +327,32 @@ func (s *SortformerAdapter) Diarize(ctx context.Context, input interfaces.AudioI
 	cmd := exec.CommandContext(ctx, "uv", args...)
 	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1")
 
-	logger.Info("Executing Sortformer command", "args", strings.Join(args, " "))
-	
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.Canceled {
-		return nil, fmt.Errorf("diarization was cancelled")
-	}
+	// Setup log file
+	logFile, err := os.OpenFile(filepath.Join(procCtx.OutputDirectory, "transcription.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		logger.Error("Sortformer execution failed", "output", string(output), "error", err)
-		return nil, fmt.Errorf("Sortformer execution failed: %w", err)
+		logger.Warn("Failed to create log file", "error", err)
+	} else {
+		defer logFile.Close()
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	}
+
+	logger.Info("Executing Sortformer command", "args", strings.Join(args, " "))
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.Canceled {
+			return nil, fmt.Errorf("diarization was cancelled")
+		}
+
+		// Read tail of log file for context
+		logPath := filepath.Join(procCtx.OutputDirectory, "transcription.log")
+		logTail, readErr := s.ReadLogTail(logPath, 2048)
+		if readErr != nil {
+			logger.Warn("Failed to read log tail", "error", readErr)
+		}
+
+		logger.Error("Sortformer execution failed", "error", err)
+		return nil, fmt.Errorf("Sortformer execution failed: %w\nLogs:\n%s", err, logTail)
 	}
 
 	// Parse result
@@ -690,7 +365,7 @@ func (s *SortformerAdapter) Diarize(ctx context.Context, input interfaces.AudioI
 	result.ModelUsed = "diar_streaming_sortformer_4spk-v2"
 	result.Metadata = s.CreateDefaultMetadata(params)
 
-	logger.Info("Sortformer diarization completed", 
+	logger.Info("Sortformer diarization completed",
 		"segments", len(result.Segments),
 		"speakers", result.SpeakerCount,
 		"processing_time", result.ProcessingTime)
@@ -702,12 +377,12 @@ func (s *SortformerAdapter) Diarize(ctx context.Context, input interfaces.AudioI
 func (s *SortformerAdapter) buildSortformerArgs(input interfaces.AudioInput, params map[string]interface{}, tempDir string) ([]string, error) {
 	outputFormat := s.GetStringParameter(params, "output_format")
 	var outputFile string
-	if outputFormat == "json" {
+	if outputFormat == OutputFormatJSON {
 		outputFile = filepath.Join(tempDir, "result.json")
 	} else {
 		outputFile = filepath.Join(tempDir, "result.rttm")
 	}
-	
+
 	scriptPath := filepath.Join(s.envPath, "sortformer_diarize.py")
 	args := []string{
 		"run", "--native-tls", "--project", s.envPath, "python", scriptPath,
@@ -747,27 +422,26 @@ func (s *SortformerAdapter) buildSortformerArgs(input interfaces.AudioInput, par
 // parseResult parses the Sortformer output
 func (s *SortformerAdapter) parseResult(tempDir string, input interfaces.AudioInput, params map[string]interface{}) (*interfaces.DiarizationResult, error) {
 	outputFormat := s.GetStringParameter(params, "output_format")
-	
-	if outputFormat == "json" {
+
+	if outputFormat == OutputFormatJSON {
 		return s.parseJSONResult(tempDir)
-	} else {
-		return s.parseRTTMResult(tempDir, input)
 	}
+	return s.parseRTTMResult(tempDir, input)
 }
 
 // parseJSONResult parses JSON format output
 func (s *SortformerAdapter) parseJSONResult(tempDir string) (*interfaces.DiarizationResult, error) {
 	resultFile := filepath.Join(tempDir, "result.json")
-	
+
 	data, err := os.ReadFile(resultFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read result file: %w", err)
 	}
 
 	var sortformerResult struct {
-		AudioFile     string `json:"audio_file"`
-		Model         string `json:"model"`
-		Segments      []struct {
+		AudioFile string `json:"audio_file"`
+		Model     string `json:"model"`
+		Segments  []struct {
 			Start      float64 `json:"start"`
 			End        float64 `json:"end"`
 			Speaker    string  `json:"speaker"`
@@ -806,7 +480,7 @@ func (s *SortformerAdapter) parseJSONResult(tempDir string) (*interfaces.Diariza
 // parseRTTMResult parses RTTM format output
 func (s *SortformerAdapter) parseRTTMResult(tempDir string, input interfaces.AudioInput) (*interfaces.DiarizationResult, error) {
 	resultFile := filepath.Join(tempDir, "result.rttm")
-	
+
 	data, err := os.ReadFile(resultFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read result file: %w", err)
@@ -868,12 +542,7 @@ func (s *SortformerAdapter) parseRTTMResult(tempDir string, input interfaces.Aud
 func (s *SortformerAdapter) GetEstimatedProcessingTime(input interfaces.AudioInput) time.Duration {
 	// Sortformer is typically very fast, often faster than real-time
 	baseTime := s.BaseAdapter.GetEstimatedProcessingTime(input)
-	
+
 	// Sortformer typically processes at about 5-10% of audio duration
 	return time.Duration(float64(baseTime) * 0.3)
-}
-
-// init registers the Sortformer adapter
-func init() {
-	registry.RegisterDiarizationAdapter("sortformer", NewSortformerAdapter())
 }
